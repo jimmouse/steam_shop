@@ -1,0 +1,309 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────── 用户与身份 ───────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id           String    @id @default(cuid())
+  role         Role      @default(USER)
+  balance      Decimal   @default(0) @db.Decimal(12, 2)
+  locale       String    @default("zh")
+  mergedIntoId String?   @map("merged_into_id")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  identities     Identity[]
+  orders         Order[]
+  tickets        Ticket[]
+  ticketMessages TicketMessage[]
+
+  @@map("users")
+}
+
+enum IdentityProvider {
+  EMAIL
+  TELEGRAM
+  DISCORD
+}
+
+/// 一个用户可挂多个登录身份（邮箱 / Telegram / Discord）
+model Identity {
+  id           String           @id @default(cuid())
+  userId       String           @map("user_id")
+  provider     IdentityProvider
+  providerUid  String           @map("provider_uid") // 邮箱小写 / tg user id / discord id
+  passwordHash String?          @map("password_hash") // 仅 EMAIL 使用
+  displayName  String?          @map("display_name")
+  verifiedAt   DateTime?        @map("verified_at")
+  createdAt    DateTime         @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([provider, providerUid])
+  @@index([userId])
+  @@map("identities")
+}
+
+enum CodePurpose {
+  REGISTER
+  BIND_EMAIL
+  RESET_PASSWORD
+}
+
+model VerificationCode {
+  id        String      @id @default(cuid())
+  email     String
+  code      String
+  purpose   CodePurpose
+  expiresAt DateTime    @map("expires_at")
+  usedAt    DateTime?   @map("used_at")
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  @@index([email, purpose])
+  @@map("verification_codes")
+}
+
+// ─────────────────────────── 商品与库存 ───────────────────────────
+
+enum ProductType {
+  ACCOUNT       // 卖账号，自动发货
+  TOPUP         // 代充，人工处理
+  REGION_CHANGE // 改区，人工处理
+}
+
+enum DeliveryMode {
+  AUTO_INVENTORY // 支付后从库存自动发货
+  MANUAL_TICKET  // 支付后自动开工单，人工处理
+}
+
+model Product {
+  id           String       @id @default(cuid())
+  slug         String       @unique
+  type         ProductType
+  deliveryMode DeliveryMode @map("delivery_mode")
+  region       String       // TR / AR / RU / CN / US / GLOBAL ...
+  name         String
+  description  String?      @db.Text
+  /// 商品封面图 URL（可选，留空则显示自动生成的封面）
+  imageUrl     String?      @map("image_url")
+  /// 常见问题，JSON 数组：[{ q, a }]
+  faq          Json?
+  /// 多语言内容：{ en: { name, description, faq }, ru: {...}, ar: {...} }，缺省回退到主字段
+  i18n         Json?
+  price        Decimal      @db.Decimal(12, 2)
+  currency     String       @default("USD")
+  /// 下单时要求用户填写的字段，JSON 数组：[{ key, label, required }]
+  inputSchema  Json?        @map("input_schema")
+  active       Boolean      @default(true)
+  sortOrder    Int          @default(0) @map("sort_order")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  inventory InventoryItem[]
+  orders    Order[]
+  variants  ProductVariant[]
+
+  @@index([active, sortOrder])
+  @@map("products")
+}
+
+/// 商品规格（如代充 5U / 10U / 20U），价格以 USD 计
+model ProductVariant {
+  id        String   @id @default(cuid())
+  productId String   @map("product_id")
+  name      String   // 语言中立的规格名，如 "10 USD" / "100 TL"
+  /// 各语言显示名：{ zh: "10 美元", en: "10 USD", ru: "10 долларов", ar: "10 دولار" }，缺省回退 name
+  i18n      Json?
+  price     Decimal  @db.Decimal(12, 2)
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  product   Product         @relation(fields: [productId], references: [id])
+  inventory InventoryItem[]
+  orders    Order[]
+
+  @@index([productId, active, sortOrder])
+  @@map("product_variants")
+}
+
+enum InventoryStatus {
+  AVAILABLE
+  LOCKED
+  SOLD
+}
+
+model InventoryItem {
+  id          String          @id @default(cuid())
+  productId   String          @map("product_id")
+  variantId   String?         @map("variant_id")
+  status      InventoryStatus @default(AVAILABLE)
+  /// 发货内容原文，例如 "账号----密码----邮箱----邮箱密码"
+  payload     String          @db.Text
+  orderId     String?         @map("order_id")
+  lockedUntil DateTime?       @map("locked_until")
+  soldAt      DateTime?       @map("sold_at")
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  product Product         @relation(fields: [productId], references: [id])
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
+  order   Order?          @relation(fields: [orderId], references: [id])
+
+  @@index([productId, variantId, status])
+  @@index([orderId])
+  @@map("inventory_items")
+}
+
+// ─────────────────────────── 订单 ───────────────────────────
+
+enum OrderStatus {
+  PENDING    // 待支付（库存已锁定）
+  PAID       // 已支付，待发货
+  PROCESSING // 人工处理中（代充/改区）
+  DELIVERED  // 已交付
+  EXPIRED    // 超时未支付，库存已释放
+  CANCELLED
+  REFUNDED
+}
+
+enum OrderSource {
+  WEB
+  TELEGRAM
+  DISCORD
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNo         String      @unique @map("order_no")
+  userId          String      @map("user_id")
+  productId       String      @map("product_id")
+  variantId       String?     @map("variant_id")
+  /// 下单时的规格名快照
+  variantName     String?     @map("variant_name")
+  quantity        Int         @default(1)
+  unitPrice       Decimal     @map("unit_price") @db.Decimal(12, 2)
+  amount          Decimal     @db.Decimal(12, 2)
+  currency        String      @default("USD")
+  status          OrderStatus @default(PENDING)
+  source          OrderSource @default(WEB)
+  /// 用户下单时填写的信息（代充账号、好友链接等）
+  customerInput   Json?       @map("customer_input")
+  /// 交付给用户的内容（账号密码等）
+  deliveryPayload String?     @map("delivery_payload") @db.Text
+  expiresAt       DateTime    @map("expires_at")
+  paidAt          DateTime?   @map("paid_at")
+  deliveredAt     DateTime?   @map("delivered_at")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+
+  user           User            @relation(fields: [userId], references: [id])
+  product        Product         @relation(fields: [productId], references: [id])
+  variant        ProductVariant? @relation(fields: [variantId], references: [id])
+  inventoryItems InventoryItem[]
+  payments       Payment[]
+  tickets        Ticket[]
+
+  @@index([userId, createdAt])
+  @@index([status, expiresAt])
+  @@map("orders")
+}
+
+// ─────────────────────────── 支付 ───────────────────────────
+
+enum PaymentProvider {
+  MOCK    // 模拟支付商（开发/测试）
+  BEPUSDT // 自托管 BEpusdt 网关：多链 USDT / USDC / 原生币，纯监听
+}
+
+enum PaymentStatus {
+  PENDING   // 已创建，等待用户支付
+  CONFIRMED // 已到账（网关回调或后台人工确认）
+  FAILED    // 作废 / 被拒 / 换链后的旧记录
+  EXPIRED   // 网关侧超时
+}
+
+model Payment {
+  id          String          @id @default(cuid())
+  orderId     String          @map("order_id")
+  provider    PaymentProvider
+  providerRef String?         @map("provider_ref") // 支付商侧的单号
+  amount      Decimal         @db.Decimal(12, 2)
+  currency    String          @default("USD")
+  status      PaymentStatus   @default(PENDING)
+  txHash      String?         @map("tx_hash")
+  /// 网关返回的附加信息（收银台 URL、二维码、匹配金额、支付币种等）
+  meta        Json?
+  rawCallback Json?           @map("raw_callback")
+  confirmedAt DateTime?       @map("confirmed_at")
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([provider, providerRef])
+  @@map("payments")
+}
+
+// ─────────────────────────── 工单 ───────────────────────────
+
+enum TicketType {
+  PRESALE       // 售前咨询，无订单
+  TOPUP         // 代充（订单支付后自动创建）
+  REGION_CHANGE // 改区（订单支付后自动创建）
+  SUPPORT       // 售后 / 其他
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_USER
+  RESOLVED
+  CLOSED
+}
+
+model Ticket {
+  id        String       @id @default(cuid())
+  ticketNo  String       @unique @map("ticket_no")
+  userId    String       @map("user_id")
+  orderId   String?      @map("order_id")
+  type      TicketType
+  status    TicketStatus @default(OPEN)
+  subject   String
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  user     User            @relation(fields: [userId], references: [id])
+  order    Order?          @relation(fields: [orderId], references: [id])
+  messages TicketMessage[]
+
+  @@index([userId, createdAt])
+  @@index([status, updatedAt])
+  @@map("tickets")
+}
+
+model TicketMessage {
+  id        String   @id @default(cuid())
+  ticketId  String   @map("ticket_id")
+  authorId  String?  @map("author_id") // null = 系统消息
+  isStaff   Boolean  @default(false) @map("is_staff")
+  body      String   @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  ticket Ticket @relation(fields: [ticketId], references: [id])
+  author User?  @relation(fields: [authorId], references: [id])
+
+  @@index([ticketId, createdAt])
+  @@map("ticket_messages")
+}
